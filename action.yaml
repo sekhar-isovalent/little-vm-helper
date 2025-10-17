@@ -53,6 +53,10 @@ inputs:
     description: 'Serial port to access VM'
     required: true
     default: '0'
+  disable-cache:
+    description: 'Disable caching of deb packages, LVH images and kernels'
+    required: false
+    default: 'false'
   cpu:
     description: 'CPU count'
     required: false
@@ -120,39 +124,54 @@ runs:
         sudo mv /tmp/lvh /bin/lvh
 
     - name: Load install packages from GitHub cache
-      if: ${{ inputs.provision == 'true' && inputs.install-dependencies == 'true' }}
+      if: ${{ inputs.provision == 'true' && inputs.install-dependencies == 'true' && inputs.disable-cache != 'true' }}
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       id: package-cache
       with:
-        path: /tmp/.ubuntu-pkgs
+        path: ${{ inputs.images-folder-parent }}/.ubuntu-pkgs
         key: ${{ runner.os }}-${{ steps.find-lvh-cli.outputs.runner_os_id }}-pkgs-cilium-little-vm-helper-${{ steps.find-lvh-cli.outputs.dependency_list_sha }}
 
     - name: Download LVH dependencies
       if: ${{ inputs.provision == 'true' && inputs.install-dependencies == 'true' && steps.package-cache.outputs.cache-hit != 'true' }}
       shell: bash
       run: |
+        DOWNLOAD_OPTION=$([ "${{ inputs.disable-cache }}" == "true" ] && echo "" || echo "--download-only")
         n=0
         until [ "$n" -ge 5 ]; do
           success=1
           sudo apt update && \
           sudo apt-get clean && \
-          sudo apt-get -d -y --no-install-recommends install ${{steps.find-lvh-cli.outputs.dependency_list}} && \
+          sudo apt-get ${DOWNLOAD_OPTION} -y --no-install-recommends install ${{steps.find-lvh-cli.outputs.dependency_list}} && \
           break || success=0
           n=$((n+1))
           sleep 1
         done
         [ $success -eq 1 ] || exit 42
-        sudo mkdir -p /tmp/.ubuntu-pkgs
-        sudo cp /var/cache/apt/archives/*.deb /tmp/.ubuntu-pkgs
+        if [ "${{ inputs.disable-cache }}" != "true" ]; then
+          if [ "$(ls -A /var/cache/apt/archives/*.deb | wc -l)" -eq 0 ]; then
+            echo "No packages downloaded"
+          else
+            echo "Downloaded packages:"
+            sudo mkdir -p ${{ inputs.images-folder-parent }}/.ubuntu-pkgs
+            sudo cp /var/cache/apt/archives/*.deb ${{ inputs.images-folder-parent }}/.ubuntu-pkgs
+          fi
+        fi
+
 
     - name: Install dependencies
-      if: ${{ inputs.provision == 'true' && inputs.install-dependencies == 'true' }}
+      if: ${{ inputs.provision == 'true' && inputs.install-dependencies == 'true' && inputs.disable-cache != 'true' }}
       shell: bash
       run: |
         # Disable auto update of man-db for every package
-        sudo rm /var/lib/man-db/auto-update
-        sudo cp /tmp/.ubuntu-pkgs/*.deb /var/cache/apt/archives/
-        sudo apt-get -y --no-install-recommends install /tmp/.ubuntu-pkgs/*.deb
+        sudo rm -f /var/lib/man-db/auto-update
+        if [ -d ${{ inputs.images-folder-parent }}/.ubuntu-pkgs ] && [ "$(ls -A ${{ inputs.images-folder-parent }}/.ubuntu-pkgs/*.deb | wc -l)" -gt 0 ]; then
+          echo "Installing packages from cache"
+          sudo cp ${{ inputs.images-folder-parent }}/.ubuntu-pkgs/*.deb /var/cache/apt/archives/
+          sudo apt-get -y --no-install-recommends install ${{ inputs.images-folder-parent }}/.ubuntu-pkgs/*.deb
+        else
+          echo "No cached packages found, All packages should have been installed during runner bootstrap"
+        fi
+        sudo rm -rf ${{ inputs.images-folder-parent }}/.ubuntu-pkgs
         sudo kvm-ok
 
     - name: Derive VM image file name
@@ -202,10 +221,12 @@ runs:
       if: ${{ inputs.provision == 'true' && inputs.kernel-version != '' && steps.cache-lvh-kernel.outputs.cache-hit != 'true' }}
       shell: bash
       run: |
-        lvh kernel pull --platform=linux/${{ inputs.arch }} --dir "${{ inputs.images-folder-parent }}/kernels/${{ inputs.arch }}" ${{ inputs.kernel-version }}
+        sudo lvh kernel pull --platform=linux/${{ inputs.arch }} --dir "${{ inputs.images-folder-parent }}/kernels/${{ inputs.arch }}" ${{ inputs.kernel-version }}
+        sudo chown -R $USER:$USER ${{ inputs.images-folder-parent }}/kernels/${{ inputs.arch }}/
 
     - name: Set kernel path
       id: kernel-path
+      if: ${{ inputs.provision == 'true' && inputs.kernel-version != '' }}
       shell: bash
       run: |
         echo lvh_kernel_path=$(find ${{ inputs.images-folder-parent }}/kernels/${{ inputs.arch }}/${{ inputs.kernel-version }}/boot/ -name "vmlinuz-*" -type f | head -1) >> "$GITHUB_OUTPUT"
